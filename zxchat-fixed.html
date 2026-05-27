@@ -1227,7 +1227,7 @@ function getPendingRole(otherUser){
 
 // ── PFP (Profile Picture) ──
 // Stored as small base64 jpeg per user — synced via Ably so all browsers see it
-const getPfp  = name => S.get('zx_pfp_'+name) || null;
+const getPfp  = name => { const v = S.get('zx_pfp_'+name); return (v && v !== 'null') ? v : null; };
 const savePfp = (name, data) => S.set('zx_pfp_'+name, data);
 
 // Cloudinary config — persisted locally so users only configure once
@@ -1824,7 +1824,11 @@ function renderSidebar(){
     // Merge localStorage users + all currently online users (from presence registry)
     const allKnown = [...new Set([...getUsers(), ...getAllUsers(), ...Array.from(onlineUsers)])];
     const all = allKnown.filter(u=>u!==ME && u.toLowerCase().includes(filter));
-    const friends=getFriends(ME), pending=getReqs().filter(r=>r.from===ME).map(r=>r.to);
+    const friends=getFriends(ME);
+    // Combine both sources: Ably-sent requests AND locally tracked pending-sent
+    const pendingViaReqs = getReqs().filter(r=>r.from===ME).map(r=>r.to);
+    const pendingViaSent = getPendingSent();
+    const pending = [...new Set([...pendingViaReqs, ...pendingViaSent])];
     if(!all.length){
       list.innerHTML='<div class="empty-state">No users found for "<b>'+esc(filter)+'</b>"<br><span style="font-size:10px;color:#404040;">Ask them to open ZX Chat so they appear online</span></div>';
       return;
@@ -1833,15 +1837,21 @@ function renderSidebar(){
       const isFr=friends.includes(u), isPend=pending.includes(u);
       const isOnline = onlineUsers.has(u);
       const onlinePill = isOnline ? `<span style="font-size:9px;color:#4ade80;background:#0a1a0a;border:1px solid #1a3a1a;border-radius:8px;padding:1px 6px;margin-left:4px;">Online</span>` : '';
-      list.innerHTML+=`<div class="person-item">
+      const div = document.createElement('div');
+      div.className = 'person-item';
+      div.innerHTML = `
         ${avatarHTML(u,44,false,'',true)}
         <div class="ci"><div class="cn">${esc(u)}${onlinePill}</div><div class="cp">${isFr?'Connected':'ZX User'}</div></div>
-        <button class="connect-btn" onclick="sendFriendReq('${esc(u)}')"
+        <button class="connect-btn"
           ${!isAdmin()&&(isFr||isPend)?'disabled':''}
           style="${isAdmin()&&!isFr?'background:#1a1000;border-color:#f59e0b;color:#f59e0b;':''}">
           ${isFr?'✓ Connected':isAdmin()?'⚡ Force Add':isPend?'✓ Sent':'+ Connect'}
-        </button>
-      </div>`;
+        </button>`;
+      // Safe event listener — no string interpolation in onclick
+      if(!(!isAdmin()&&(isFr||isPend))){
+        div.querySelector('.connect-btn').addEventListener('click', ()=>sendFriendReq(u));
+      }
+      list.appendChild(div);
     });
   }
 }
@@ -1855,9 +1865,13 @@ function buildPendingBanner(fromUser){
     <div style="font-size:28px;">👋</div>
     <div class="pending-banner-title">${esc(fromUser)} wants to connect</div>
     <div class="pending-banner-sub">They can send you messages but you won't see them until you accept.<br>Their messages are hidden until you accept.</div>
-    ${req ? `<button class="pending-accept-btn" onclick="acceptRequestFromChat('${req.id}','${esc(fromUser)}')">✓ Accept Request</button>
-    <button class="pending-decline-btn" onclick="declineRequestFromChat('${req.id}')">Decline</button>` : ''}
+    ${req ? `<button class="pending-accept-btn" data-reqid="${esc(req.id)}" data-from="${esc(fromUser)}">✓ Accept Request</button>
+    <button class="pending-decline-btn" data-reqid="${esc(req.id)}">Decline</button>` : ''}
   `;
+  if(req){
+    banner.querySelector('.pending-accept-btn')?.addEventListener('click', ()=>acceptRequestFromChat(req.id, fromUser));
+    banner.querySelector('.pending-decline-btn')?.addEventListener('click', ()=>declineRequestFromChat(req.id));
+  }
   return banner;
 }
 
@@ -2497,7 +2511,10 @@ async function sendFriendReq(to){
 
   toast(`Request sent to ${to} — you can message them now`);
   renderSidebar();
-  closeModal('findModal');
+  // Refresh the find modal results so button shows "✓ Sent"
+  if(document.getElementById('findModal').style.display !== 'none'){
+    searchPeople();
+  }
   // Open the chat for the sender right away
   openChat('dm', to);
   closeSidebar();
@@ -2529,34 +2546,51 @@ function searchPeople(){
   const q=document.getElementById('findInput').value.trim().toLowerCase();
   const res=document.getElementById('findResults');
   if(!q){res.innerHTML='';return;}
-  const all=[...new Set([...getUsers(),...getAllUsers()])].filter(u=>u!==ME&&u.toLowerCase().includes(q));
-  const friends=getFriends(ME), pending=getReqs().filter(r=>r.from===ME).map(r=>r.to);
-  res.innerHTML=all.map(u=>{
+  const all=[...new Set([...getUsers(),...getAllUsers(),...Array.from(onlineUsers)])].filter(u=>u!==ME&&u.toLowerCase().includes(q));
+  const friends=getFriends(ME);
+  const pendingViaReqs = getReqs().filter(r=>r.from===ME).map(r=>r.to);
+  const pendingViaSent = getPendingSent();
+  const pending = [...new Set([...pendingViaReqs, ...pendingViaSent])];
+  res.innerHTML='';
+  all.forEach(u=>{
+    const isFr=friends.includes(u), isPend=pending.includes(u);
     const isOnline = onlineUsers.has(u);
     const onlinePill = isOnline ? `<span style="font-size:9px;color:#4ade80;background:#0a1a0a;border:1px solid #1a3a1a;border-radius:8px;padding:1px 6px;margin-left:4px;">Online</span>` : '';
-    return `<div class="person-item">
+    const div = document.createElement('div');
+    div.className = 'person-item';
+    div.innerHTML = `
       ${avatarHTML(u,44,false,'',true)}
-      <div class="ci"><div class="cn">${esc(u)}${onlinePill}</div></div>
-      <button class="connect-btn" onclick="sendFriendReq('${esc(u)}')" ${!isAdmin()&&(friends.includes(u)||pending.includes(u))?'disabled':''} style="${isAdmin()&&!friends.includes(u)?'background:#1a1000;border-color:#f59e0b;color:#f59e0b;':''}" >
-        ${friends.includes(u)?'✓ Connected':isAdmin()?'⚡ Force Add':'Connect'}
-      </button>
-    </div>`;
-  }).join('');
+      <div class="ci"><div class="cn">${esc(u)}${onlinePill}</div><div class="cp">${isFr?'Connected':'ZX User'}</div></div>
+      <button class="connect-btn" ${!isAdmin()&&(isFr||isPend)?'disabled':''} style="${isAdmin()&&!isFr?'background:#1a1000;border-color:#f59e0b;color:#f59e0b;':''}">
+        ${isFr?'✓ Connected':isAdmin()?'⚡ Force Add':isPend?'✓ Sent':'Connect'}
+      </button>`;
+    // Safe event listener — no string interpolation in onclick
+    if(!(!isAdmin()&&(isFr||isPend))){
+      div.querySelector('.connect-btn').addEventListener('click', ()=>sendFriendReq(u));
+    }
+    res.appendChild(div);
+  });
 }
 function openReqModal(){ renderReqList(); document.getElementById('reqModal').style.display='flex'; }
 function renderReqList(){
   const reqs=getReqs().filter(r=>r.to===ME);
   const el=document.getElementById('reqList');
   if(!reqs.length){el.innerHTML='<div class="empty-state">No pending requests</div>';return;}
-  el.innerHTML=reqs.map(r=>`
-    <div class="req-item">
+  el.innerHTML='';
+  reqs.forEach(r=>{
+    const div=document.createElement('div');
+    div.className='req-item';
+    div.innerHTML=`
       ${avatarHTML(r.from,44)}
       <div class="ci"><div class="cn">${esc(r.from)}</div><div class="cp">Wants to connect</div></div>
       <div>
-        <button class="btn-accept" onclick="acceptRequest('${r.id}','${esc(r.from)}')">Accept</button>
-        <button class="connect-btn" onclick="declineRequest('${r.id}')">Decline</button>
-      </div>
-    </div>`).join('');
+        <button class="btn-accept">Accept</button>
+        <button class="connect-btn">Decline</button>
+      </div>`;
+    div.querySelector('.btn-accept').addEventListener('click',()=>acceptRequest(r.id, r.from));
+    div.querySelector('.connect-btn').addEventListener('click',()=>declineRequest(r.id));
+    el.appendChild(div);
+  });
 }
 function switchTab(tab,btn){
   currentTab=tab;
@@ -2868,28 +2902,35 @@ function openCreateGroupModal(){
   if(!friends.length){
     picker.innerHTML='<div class="empty-state">No friends yet. Connect with people first.</div>';
   } else {
-    picker.innerHTML=friends.map(f=>`
-      <div class="person-item" id="gpick_${esc(f)}" onclick="toggleGroupMember('${esc(f)}')" style="cursor:pointer;">
+    picker.innerHTML='';
+    friends.forEach(f=>{
+      const div=document.createElement('div');
+      div.className='person-item';
+      div.dataset.friend=f;
+      div.style.cursor='pointer';
+      div.innerHTML=`
         ${avatarHTML(f,34)}
         <div class="ci"><div class="cn">${esc(f)}</div><div class="cp">Friend</div></div>
-        <div id="gpick_chk_${esc(f)}" style="width:22px;height:22px;border-radius:50%;border:2px solid #404040;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;flex-shrink:0;"></div>
-      </div>`).join('');
+        <div class="gpick-chk" style="width:22px;height:22px;border-radius:50%;border:2px solid #404040;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;flex-shrink:0;"></div>`;
+      div.addEventListener('click',()=>toggleGroupMember(f, div));
+      picker.appendChild(div);
+    });
   }
   document.getElementById('createGroupModal').style.display='flex';
   closeSidebar();
 }
 
-function toggleGroupMember(name){
-  const chk=document.getElementById('gpick_chk_'+name);
-  const row=document.getElementById('gpick_'+name);
+function toggleGroupMember(name, rowEl){
+  if(!rowEl) return;
+  const chk=rowEl.querySelector('.gpick-chk');
   if(selectedGroupMembers.has(name)){
     selectedGroupMembers.delete(name);
     chk.style.background='transparent'; chk.style.borderColor='#404040'; chk.innerText='';
-    row.style.background='';
+    rowEl.style.background='';
   } else {
     selectedGroupMembers.add(name);
     chk.style.background='#2563eb'; chk.style.borderColor='#2563eb'; chk.innerText='✓';
-    row.style.background='rgba(37,99,235,.08)';
+    rowEl.style.background='rgba(37,99,235,.08)';
   }
   const arr=[...selectedGroupMembers];
   document.getElementById('groupSelectedPreview').innerText=
@@ -3103,11 +3144,11 @@ function openGroupInfo(){
 function renderGroupInfoModal(g){
   const isCreator = g.createdBy === ME;
   const memberList = g.members.map(m=>`
-    <div style="display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid #1a1a1a;">
+    <div style="display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid #1a1a1a;" data-member="${esc(m)}">
       ${avatarHTML(m,36,false,'',true)}
       <div style="flex:1;font-size:13px;font-weight:600;">${esc(m)}${m===ME?'<span style="font-size:9px;color:#606060;margin-left:5px;">(you)</span>':''}</div>
       ${m===g.createdBy?'<div style="font-size:9px;color:#f59e0b;background:#1a1200;border:1px solid #3a2800;border-radius:8px;padding:2px 7px;">Admin</div>':''}
-      ${(isCreator && m !== ME) ? `<button onclick="removeMemberFromGroup('${esc(g.id)}','${esc(m)}')" style="background:transparent;border:1px solid #3a1010;border-radius:6px;color:#ef4444;font-size:10px;padding:3px 8px;cursor:pointer;margin-left:4px;">✕</button>` : ''}
+      ${(isCreator && m !== ME) ? `<button class="rm-member-btn" data-member="${esc(m)}" style="background:transparent;border:1px solid #3a1010;border-radius:6px;color:#ef4444;font-size:10px;padding:3px 8px;cursor:pointer;margin-left:4px;">✕</button>` : ''}
     </div>`).join('');
 
   document.getElementById('groupInfoModalContent').innerHTML = `
@@ -3125,11 +3166,19 @@ function renderGroupInfoModal(g){
     <div style="display:flex;gap:8px;margin-bottom:6px;">
       <input id="addMemberInput" placeholder="Username to add…" oninput="searchAddMemberSuggestions()"
         style="flex:1;background:#111;border:1px solid #252525;border-radius:7px;color:#fff;padding:9px 12px;font-size:13px;outline:none;font-family:var(--font);">
-      <button onclick="doAddMemberToGroup('${esc(g.id)}')" style="background:#1a3a1a;border:1px solid #2a4a2a;border-radius:7px;color:#4ade80;font-size:12px;padding:9px 14px;cursor:pointer;font-weight:700;white-space:nowrap;">+ Add</button>
+      <button id="addMemberBtn" style="background:#1a3a1a;border:1px solid #2a4a2a;border-radius:7px;color:#4ade80;font-size:12px;padding:9px 14px;cursor:pointer;font-weight:700;white-space:nowrap;">+ Add</button>
     </div>
     <div id="addMemberSuggestions" style="margin-bottom:6px;"></div>
     ` : ''}
   `;
+  // Attach remove-member listeners
+  document.getElementById('groupInfoModalContent').querySelectorAll('.rm-member-btn').forEach(btn=>{
+    const member = btn.dataset.member;
+    btn.addEventListener('click', ()=>removeMemberFromGroup(g.id, member));
+  });
+  // Attach add-member button listener
+  const addBtn = document.getElementById('addMemberBtn');
+  if(addBtn) addBtn.addEventListener('click', ()=>doAddMemberToGroup(g.id));
 }
 
 function searchAddMemberSuggestions(){
@@ -3141,11 +3190,18 @@ function searchAddMemberSuggestions(){
   if(!g){ box.innerHTML=''; return; }
   const all = [...new Set([...getUsers(),...getAllUsers()])].filter(u => !g.members.includes(u) && u.toLowerCase().includes(q));
   if(!all.length){ box.innerHTML=''; return; }
-  box.innerHTML = all.slice(0,4).map(u=>`
-    <div onclick="document.getElementById('addMemberInput').value='${esc(u)}';document.getElementById('addMemberSuggestions').innerHTML=''"
-      style="padding:7px 10px;background:#0a1a0a;border:1px solid #1a3a1a;border-radius:6px;font-size:12px;cursor:pointer;margin-bottom:3px;display:flex;align-items:center;gap:8px;">
-      ${avatarHTML(u,24)} <span style="color:#4ade80;">${esc(u)}</span>
-    </div>`).join('');
+  box.innerHTML='';
+  all.slice(0,4).forEach(u=>{
+    const div=document.createElement('div');
+    div.style.cssText='padding:7px 10px;background:#0a1a0a;border:1px solid #1a3a1a;border-radius:6px;font-size:12px;cursor:pointer;margin-bottom:3px;display:flex;align-items:center;gap:8px;';
+    div.innerHTML=`${avatarHTML(u,24)} <span style="color:#4ade80;">${esc(u)}</span>`;
+    div.addEventListener('click',()=>{
+      const inp=document.getElementById('addMemberInput');
+      if(inp) inp.value=u;
+      box.innerHTML='';
+    });
+    box.appendChild(div);
+  });
 }
 
 async function doAddMemberToGroup(groupId){
@@ -3277,7 +3333,6 @@ function handlePfpFile(e){
 }
 
 async function removePfp(){
-  savePfp(ME, null);
   localStorage.removeItem('zx_pfp_'+ME);
   const wrap = document.getElementById('pfpPreviewWrap');
   wrap.innerHTML = ME[0].toUpperCase();
@@ -3456,36 +3511,56 @@ function renderAdminUserList(){
   const friends = getFriends(ME);
   const el = document.getElementById('adminUserList');
   if(!friends.length){ el.innerHTML='<div style="font-size:11px;color:#404040;padding:8px 0;">No friends yet.</div>'; return; }
-  el.innerHTML = friends.map(u=>`
-    <div class="admin-user-row">
+  el.innerHTML='';
+  friends.forEach(u=>{
+    const row=document.createElement('div');
+    row.className='admin-user-row';
+    row.innerHTML=`
       ${avatarHTML(u,32)}
       <div style="flex:1;font-size:13px;font-weight:600;">${esc(u)}</div>
       <div class="admin-actions">
-        <button class="admin-btn" onclick="adminOpenChat('${esc(u)}')">💬</button>
-        <button class="admin-btn warn" onclick="adminClearUserChat('${esc(u)}')">🗑</button>
-        <button class="admin-btn danger" onclick="adminRemoveFriend('${esc(u)}')">✕</button>
-      </div>
-    </div>`).join('');
+        <button class="admin-btn" title="Open chat">💬</button>
+        <button class="admin-btn warn" title="Clear chat">🗑</button>
+        <button class="admin-btn danger" title="Remove friend">✕</button>
+      </div>`;
+    const btns=row.querySelectorAll('.admin-btn');
+    btns[0].addEventListener('click',()=>adminOpenChat(u));
+    btns[1].addEventListener('click',()=>adminClearUserChat(u));
+    btns[2].addEventListener('click',()=>adminRemoveFriend(u));
+    el.appendChild(row);
+  });
 }
 
 function renderAdminGroupList(){
   const groups = getGroups().filter(g=>g.members.includes(ME));
   const el = document.getElementById('adminGroupList');
   if(!groups.length){ el.innerHTML='<div style="font-size:11px;color:#404040;padding:8px 0;">No groups yet.</div>'; return; }
-  el.innerHTML = groups.map(g=>`
-    <div style="padding:9px 0;border-bottom:1px solid #111;">
+  el.innerHTML='';
+  groups.forEach(g=>{
+    const wrap=document.createElement('div');
+    wrap.style.cssText='padding:9px 0;border-bottom:1px solid #111;';
+    const kickBtns = g.members.filter(m=>m!==ME).map(m=>`<button class="admin-btn danger" data-member="${esc(m)}">Kick ${esc(m)}</button>`).join('');
+    wrap.innerHTML=`
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">
         <div style="width:32px;height:32px;background:#1e1e1e;border-radius:8px;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:13px;">${g.name[0].toUpperCase()}</div>
         <div style="flex:1;font-size:13px;font-weight:600;">${esc(g.name)}</div>
         <span style="font-size:10px;color:#606060;">${g.members.length} members</span>
       </div>
       <div style="display:flex;gap:6px;flex-wrap:wrap;">
-        <button class="admin-btn" onclick="adminOpenGroupChat('${esc(g.id)}')">💬 Open</button>
-        <button class="admin-btn warn" onclick="adminClearGroupChat('${esc(g.id)}')">🗑 Clear</button>
-        <button class="admin-btn success" onclick="adminPromptAddToGroup('${esc(g.id)}','${esc(g.name)}')">+ Add User</button>
-        ${g.members.filter(m=>m!==ME).map(m=>`<button class="admin-btn danger" onclick="adminKickFromGroup('${esc(m)}','${esc(g.id)}','${esc(g.name)}')">Kick ${esc(m)}</button>`).join('')}
-      </div>
-    </div>`).join('');
+        <button class="admin-btn open-grp-btn">💬 Open</button>
+        <button class="admin-btn warn clear-grp-btn">🗑 Clear</button>
+        <button class="admin-btn success add-grp-btn">+ Add User</button>
+        ${kickBtns}
+      </div>`;
+    wrap.querySelector('.open-grp-btn').addEventListener('click',()=>adminOpenGroupChat(g.id));
+    wrap.querySelector('.clear-grp-btn').addEventListener('click',()=>adminClearGroupChat(g.id));
+    wrap.querySelector('.add-grp-btn').addEventListener('click',()=>adminPromptAddToGroup(g.id,g.name));
+    wrap.querySelectorAll('.admin-btn.danger[data-member]').forEach(btn=>{
+      const member=btn.dataset.member;
+      btn.addEventListener('click',()=>adminKickFromGroup(member,g.id,g.name));
+    });
+    el.appendChild(wrap);
+  });
 }
 
 // Force-add a user without their consent
@@ -3524,11 +3599,17 @@ function adminSearchUsers(){
   if(!q){ box.innerHTML=''; return; }
   const all = [...new Set([...getUsers(),...getAllUsers()])].filter(u=>u!==ME&&u.toLowerCase().includes(q));
   if(!all.length){ box.innerHTML=''; return; }
-  box.innerHTML = all.slice(0,5).map(u=>`
-    <div onclick="document.getElementById('adminAddInput').value='${esc(u)}';document.getElementById('adminAddSuggestions').innerHTML=''"
-      style="padding:7px 10px;background:#111;border-radius:6px;font-size:12px;cursor:pointer;margin-bottom:3px;display:flex;align-items:center;gap:8px;">
-      ${avatarHTML(u,24)} ${esc(u)}
-    </div>`).join('');
+  box.innerHTML='';
+  all.slice(0,5).forEach(u=>{
+    const div=document.createElement('div');
+    div.style.cssText='padding:7px 10px;background:#111;border-radius:6px;font-size:12px;cursor:pointer;margin-bottom:3px;display:flex;align-items:center;gap:8px;';
+    div.innerHTML=`${avatarHTML(u,24)} ${esc(u)}`;
+    div.addEventListener('click',()=>{
+      document.getElementById('adminAddInput').value=u;
+      box.innerHTML='';
+    });
+    box.appendChild(div);
+  });
 }
 
 async function adminForceAdd(){
@@ -3677,11 +3758,17 @@ function adminSearchDeleteUser(){
   if(!q){ box.innerHTML=''; return; }
   const all = [...new Set([...getUsers(),...getAllUsers()])].filter(u=>u!==ME&&u.toLowerCase().includes(q));
   if(!all.length){ box.innerHTML=''; return; }
-  box.innerHTML = all.slice(0,5).map(u=>`
-    <div onclick="document.getElementById('adminDeleteUserInput').value='${esc(u)}';document.getElementById('adminDeleteUserSuggestions').innerHTML=''"
-      style="padding:7px 10px;background:#1a0000;border:1px solid #3a1010;border-radius:6px;font-size:12px;cursor:pointer;margin-bottom:3px;display:flex;align-items:center;gap:8px;">
-      ${avatarHTML(u,24)} <span style="color:#ef4444;">${esc(u)}</span>
-    </div>`).join('');
+  box.innerHTML='';
+  all.slice(0,5).forEach(u=>{
+    const div=document.createElement('div');
+    div.style.cssText='padding:7px 10px;background:#1a0000;border:1px solid #3a1010;border-radius:6px;font-size:12px;cursor:pointer;margin-bottom:3px;display:flex;align-items:center;gap:8px;';
+    div.innerHTML=`${avatarHTML(u,24)} <span style="color:#ef4444;">${esc(u)}</span>`;
+    div.addEventListener('click',()=>{
+      document.getElementById('adminDeleteUserInput').value=u;
+      box.innerHTML='';
+    });
+    box.appendChild(div);
+  });
 }
 
 async function adminDeleteUser(){
