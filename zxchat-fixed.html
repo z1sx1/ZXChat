@@ -1355,8 +1355,14 @@ async function initAbly(){
       try{ presence.leave(); }catch(e){}
       try{ usersCh.presence.leave(); }catch(e){}
     } else {
+      // Re-enter presence so others see us again
       presence.enter({name: ME, status:'online'}).catch(()=>{});
       usersCh.presence.enter({name:ME, pin:getPin(ME)||null, pfp:getPfp(ME)||null}).catch(()=>{});
+      // Re-announce ourselves so new devices can discover us
+      const myPfp2 = getPfp(ME);
+      pub('register', {name:ME, pin:getPin(ME), pfp: myPfp2||null}).catch(()=>{});
+      // Pull fresh presence to discover any devices that came online while we were hidden
+      pullLivePresence().then(()=>{ renderSidebar(); updateHeaderStatus(); }).catch(()=>{});
     }
   });
 
@@ -1821,38 +1827,42 @@ function renderSidebar(){
       list.innerHTML='<div class="empty-state">🔍 Type a name above to search for people</div>';
       return;
     }
-    // Merge localStorage users + all currently online users (from presence registry)
-    const allKnown = [...new Set([...getUsers(), ...getAllUsers(), ...Array.from(onlineUsers)])];
-    const all = allKnown.filter(u=>u!==ME && u.toLowerCase().includes(filter));
-    const friends=getFriends(ME);
-    // Combine both sources: Ably-sent requests AND locally tracked pending-sent
-    const pendingViaReqs = getReqs().filter(r=>r.from===ME).map(r=>r.to);
-    const pendingViaSent = getPendingSent();
-    const pending = [...new Set([...pendingViaReqs, ...pendingViaSent])];
-    if(!all.length){
-      list.innerHTML='<div class="empty-state">No users found for "<b>'+esc(filter)+'</b>"<br><span style="font-size:10px;color:#404040;">Ask them to open ZX Chat so they appear online</span></div>';
-      return;
-    }
-    all.forEach(u=>{
-      const isFr=friends.includes(u), isPend=pending.includes(u);
-      const isOnline = onlineUsers.has(u);
-      const onlinePill = isOnline ? `<span style="font-size:9px;color:#4ade80;background:#0a1a0a;border:1px solid #1a3a1a;border-radius:8px;padding:1px 6px;margin-left:4px;">Online</span>` : '';
-      const div = document.createElement('div');
-      div.className = 'person-item';
-      div.innerHTML = `
-        ${avatarHTML(u,44,false,'',true)}
-        <div class="ci"><div class="cn">${esc(u)}${onlinePill}</div><div class="cp">${isFr?'Connected':'ZX User'}</div></div>
-        <button class="connect-btn"
-          ${!isAdmin()&&(isFr||isPend)?'disabled':''}
-          style="${isAdmin()&&!isFr?'background:#1a1000;border-color:#f59e0b;color:#f59e0b;':''}">
-          ${isFr?'✓ Connected':isAdmin()?'⚡ Force Add':isPend?'✓ Sent':'+ Connect'}
-        </button>`;
-      // Safe event listener — no string interpolation in onclick
-      if(!(!isAdmin()&&(isFr||isPend))){
-        div.querySelector('.connect-btn').addEventListener('click', ()=>sendFriendReq(u));
+    // Show loading state while fetching
+    list.innerHTML='<div style="text-align:center;padding:18px;color:#505050;font-size:12px;">🔍 Searching…</div>';
+    // Pull live Ably presence so users on other devices are always discoverable
+    pullLivePresence().then(()=>{
+      list.innerHTML='';
+      const allKnown = [...new Set([...getUsers(), ...getAllUsers(), ...Array.from(onlineUsers)])];
+      const all = allKnown.filter(u=>u!==ME && u.toLowerCase().includes(filter));
+      const friends=getFriends(ME);
+      const pendingViaReqs = getReqs().filter(r=>r.from===ME).map(r=>r.to);
+      const pendingViaSent = getPendingSent();
+      const pending = [...new Set([...pendingViaReqs, ...pendingViaSent])];
+      if(!all.length){
+        list.innerHTML=`<div class="empty-state">No users found for "<b>${esc(filter)}</b>"<br><span style="font-size:10px;color:#404040;">Make sure they are logged into ZX Chat</span></div>`;
+        return;
       }
-      list.appendChild(div);
-    });
+      all.forEach(u=>{
+        const isFr=friends.includes(u), isPend=pending.includes(u);
+        const isOnline = onlineUsers.has(u);
+        const onlinePill = isOnline ? `<span style="font-size:9px;color:#4ade80;background:#0a1a0a;border:1px solid #1a3a1a;border-radius:8px;padding:1px 6px;margin-left:4px;">Online</span>` : '';
+        const div = document.createElement('div');
+        div.className = 'person-item';
+        div.innerHTML = `
+          ${avatarHTML(u,44,false,'',true)}
+          <div class="ci"><div class="cn">${esc(u)}${onlinePill}</div><div class="cp">${isFr?'Connected':isOnline?'Online now':'ZX User'}</div></div>
+          <button class="connect-btn"
+            ${!isAdmin()&&(isFr||isPend)?'disabled':''}
+            style="${isAdmin()&&!isFr?'background:#1a1000;border-color:#f59e0b;color:#f59e0b;':''}">
+            ${isFr?'✓ Connected':isAdmin()?'⚡ Force Add':isPend?'✓ Sent':'+ Connect'}
+          </button>`;
+        if(!(!isAdmin()&&(isFr||isPend))){
+          div.querySelector('.connect-btn').addEventListener('click', ()=>sendFriendReq(u));
+        }
+        list.appendChild(div);
+      });
+    }).catch(()=>{ list.innerHTML='<div class="empty-state">Search failed. Check your connection.</div>'; });
+    return; // don't fall through — async render handles it
   }
 }
 
@@ -2541,34 +2551,77 @@ function declineRequest(reqId){
 }
 
 // ── MODALS ──
-function openFindModal(){ document.getElementById('findModal').style.display='flex'; searchPeople(); }
+function openFindModal(){
+  document.getElementById('findModal').style.display='flex';
+  // Pull live presence immediately when modal opens so all online devices are visible
+  pullLivePresence().then(()=>searchPeople());
+}
+
+// ── Pull ALL currently-online members from Ably presence in real time ──
+// This is the key fix: instead of relying on locally cached user lists,
+// we query Ably directly so devices on other phones are always discoverable.
+async function pullLivePresence(){
+  if(!ably) return;
+  try {
+    const usersCh = ably.channels.get('zx:users');
+    const members = await usersCh.presence.get();
+    members.forEach(m=>{
+      if(!m.clientId || m.clientId===ME) return;
+      mergeUser(m.clientId);
+      onlineUsers.add(m.clientId);
+      if(m.data){
+        if(m.data.pin && !getPin(m.clientId)) setPin(m.clientId, m.data.pin);
+        if(m.data.pfp && !getPfp(m.clientId)) savePfp(m.clientId, m.data.pfp);
+      }
+    });
+    // Also pull from global presence channel for any users not on zx:users
+    const globalCh = ably.channels.get('zx:global');
+    const globalMembers = await globalCh.presence.get();
+    globalMembers.forEach(m=>{
+      if(!m.clientId || m.clientId===ME) return;
+      mergeUser(m.clientId);
+      onlineUsers.add(m.clientId);
+    });
+  } catch(e){ console.log('pullLivePresence failed', e); }
+}
+
 function searchPeople(){
   const q=document.getElementById('findInput').value.trim().toLowerCase();
   const res=document.getElementById('findResults');
-  if(!q){res.innerHTML='';return;}
-  const all=[...new Set([...getUsers(),...getAllUsers(),...Array.from(onlineUsers)])].filter(u=>u!==ME&&u.toLowerCase().includes(q));
-  const friends=getFriends(ME);
-  const pendingViaReqs = getReqs().filter(r=>r.from===ME).map(r=>r.to);
-  const pendingViaSent = getPendingSent();
-  const pending = [...new Set([...pendingViaReqs, ...pendingViaSent])];
-  res.innerHTML='';
-  all.forEach(u=>{
-    const isFr=friends.includes(u), isPend=pending.includes(u);
-    const isOnline = onlineUsers.has(u);
-    const onlinePill = isOnline ? `<span style="font-size:9px;color:#4ade80;background:#0a1a0a;border:1px solid #1a3a1a;border-radius:8px;padding:1px 6px;margin-left:4px;">Online</span>` : '';
-    const div = document.createElement('div');
-    div.className = 'person-item';
-    div.innerHTML = `
-      ${avatarHTML(u,44,false,'',true)}
-      <div class="ci"><div class="cn">${esc(u)}${onlinePill}</div><div class="cp">${isFr?'Connected':'ZX User'}</div></div>
-      <button class="connect-btn" ${!isAdmin()&&(isFr||isPend)?'disabled':''} style="${isAdmin()&&!isFr?'background:#1a1000;border-color:#f59e0b;color:#f59e0b;':''}">
-        ${isFr?'✓ Connected':isAdmin()?'⚡ Force Add':isPend?'✓ Sent':'Connect'}
-      </button>`;
-    // Safe event listener — no string interpolation in onclick
-    if(!(!isAdmin()&&(isFr||isPend))){
-      div.querySelector('.connect-btn').addEventListener('click', ()=>sendFriendReq(u));
+  if(!q){res.innerHTML='<div class="empty-state" style="padding:20px 0;color:#505050;font-size:12px;">Type a name to search all users</div>';return;}
+
+  // Show a loading spinner while we fetch live presence
+  res.innerHTML='<div style="text-align:center;padding:18px;color:#505050;font-size:12px;">🔍 Searching…</div>';
+
+  // Always pull live presence before rendering results — ensures cross-device discovery
+  pullLivePresence().then(()=>{
+    const all=[...new Set([...getUsers(),...getAllUsers(),...Array.from(onlineUsers)])].filter(u=>u!==ME&&u.toLowerCase().includes(q));
+    const friends=getFriends(ME);
+    const pendingViaReqs = getReqs().filter(r=>r.from===ME).map(r=>r.to);
+    const pendingViaSent = getPendingSent();
+    const pending = [...new Set([...pendingViaReqs, ...pendingViaSent])];
+    res.innerHTML='';
+    if(!all.length){
+      res.innerHTML=`<div class="empty-state" style="padding:20px 0;">No users found for "<b>${esc(q)}</b>"<br><span style="font-size:10px;color:#404040;">Make sure they are logged into ZX Chat</span></div>`;
+      return;
     }
-    res.appendChild(div);
+    all.forEach(u=>{
+      const isFr=friends.includes(u), isPend=pending.includes(u);
+      const isOnline = onlineUsers.has(u);
+      const onlinePill = isOnline ? `<span style="font-size:9px;color:#4ade80;background:#0a1a0a;border:1px solid #1a3a1a;border-radius:8px;padding:1px 6px;margin-left:4px;">Online</span>` : '';
+      const div = document.createElement('div');
+      div.className = 'person-item';
+      div.innerHTML = `
+        ${avatarHTML(u,44,false,'',true)}
+        <div class="ci"><div class="cn">${esc(u)}${onlinePill}</div><div class="cp">${isFr?'Connected':isOnline?'Online now':'ZX User'}</div></div>
+        <button class="connect-btn" ${!isAdmin()&&(isFr||isPend)?'disabled':''} style="${isAdmin()&&!isFr?'background:#1a1000;border-color:#f59e0b;color:#f59e0b;':''}">
+          ${isFr?'✓ Connected':isAdmin()?'⚡ Force Add':isPend?'✓ Sent':'Connect'}
+        </button>`;
+      if(!(!isAdmin()&&(isFr||isPend))){
+        div.querySelector('.connect-btn').addEventListener('click', ()=>sendFriendReq(u));
+      }
+      res.appendChild(div);
+    });
   });
 }
 function openReqModal(){ renderReqList(); document.getElementById('reqModal').style.display='flex'; }
@@ -2595,7 +2648,13 @@ function renderReqList(){
 function switchTab(tab,btn){
   currentTab=tab;
   document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
-  btn.classList.add('active'); renderSidebar();
+  btn.classList.add('active');
+  // Pull fresh live presence whenever user opens the People tab
+  if(tab==='people' && ably){
+    pullLivePresence().then(()=>renderSidebar()).catch(()=>renderSidebar());
+  } else {
+    renderSidebar();
+  }
 }
 function closeModal(id){ document.getElementById(id).style.display='none'; }
 function refreshBadge(){
@@ -3845,7 +3904,20 @@ setInterval(async ()=>{
     const myPfp = getPfp(ME);
     await pub('register', {name:ME, pin:getPin(ME), pfp: myPfp||null}).catch(()=>{});
   }
-}, 5 * 60 * 1000); // every 5 minutes
+}, 60 * 1000); // every 60 seconds — keeps user discoverable across devices
+
+// ── PERIODIC LIVE PRESENCE PULL: ensures cross-device discovery stays fresh ──
+// Every 30 seconds, query Ably presence so users who came online on other devices
+// are discovered without needing the People tab to be opened manually.
+let _presencePullCount = 0;
+setInterval(async ()=>{
+  if(ME && ably){
+    _presencePullCount++;
+    await pullLivePresence().catch(()=>{});
+    // Only re-render sidebar if on People tab (avoid disrupting chat view)
+    if(currentTab === 'people') renderSidebar();
+  }
+}, 30 * 1000);
 </script>
 </body>
 </html>
